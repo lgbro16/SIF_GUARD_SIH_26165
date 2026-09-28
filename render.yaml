@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: sif-guard-backend
+    runtime: python
+    rootDir: Backend/SIH26165_ML
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: GEMINI_API_KEY
+        sync: false

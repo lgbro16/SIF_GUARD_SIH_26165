@@ -1,0 +1,11 @@
+{
+  "name": "sif-guard-sih-26165",
+  "private": true,
+  "scripts": {
+    "dev:frontend": "npm --prefix Frontend/FRONTEND run dev",
+    "build:frontend": "npm --prefix Frontend/FRONTEND run build"
+  },
+  "dependencies": {
+    "ngrok": "^5.0.0-beta.2"
+  }
+}
