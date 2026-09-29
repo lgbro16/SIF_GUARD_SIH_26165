@@ -1,8 +1,8 @@
-{
+﻿{
   "rewrites": [
     {
-      "source": "/(.*)",
-      "destination": "/index.html"
+      "source": "/api/(.*)",
+      "destination": "https://sif-guard-sih-26165.onrender.com/api/$1"
     }
   ]
 }
