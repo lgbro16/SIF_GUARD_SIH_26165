@@ -4,10 +4,20 @@ Evaluates reports against an IOGP-aligned Life-Saving Rule mapping.
 Distinguishes canonical IOGP rules (IOGP Report 459) from prototype extension categories.
 Combines dense semantic embedding similarity with rule-based keyword fallback.
 Terminology compliance: Uses 'Rule Match Score' and 'Match Strength' (NOT 'Model Confidence').
+
+MEMORY OPTIMIZATION: LSR rule description embeddings are precomputed ONCE and cached.
+No separate SentenceTransformer model — uses the shared singleton from embeddings.py.
+At runtime: ONE report embedding compared against cached rule embeddings.
 """
 
-from typing import List, Dict
-from ai.embeddings import embed_text, semantic_similarity
+import os
+import threading
+import numpy as np
+from typing import List, Dict, Optional
+from ai.embeddings import embed_text, embed_documents, is_sentence_transformer_available
+
+MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
+LSR_EMB_PATH = os.path.join(MODELS_DIR, "lsr_embeddings.npy")
 
 
 # IOGP-aligned Life-Saving Rule mapping:
@@ -156,12 +166,72 @@ IOGP_ALIGNED_LIFE_SAVING_RULES = {
 # Alias for backward compatibility
 IOGP_LIFE_SAVING_RULES = IOGP_ALIGNED_LIFE_SAVING_RULES
 
+# ── PRECOMPUTED RULE EMBEDDING CACHE ──────────────────────────────────────
+# Rule descriptions are static — computed ONCE, reused every request.
+# Protects against re-embedding the same 10 sentences on every analyze call.
+_RULE_NAMES: List[str] = []
+_RULE_DESCS: List[str] = []
+_RULE_EMBEDDINGS: Optional[np.ndarray] = None  # shape: (N_rules, 384)
+_CACHE_LOCK = threading.Lock()
+
+
+def _ensure_rule_embeddings_cached():
+    """
+    Precomputes and caches embeddings for all LSR descriptions.
+    Called lazily on first match_life_saving_rules() invocation.
+    Thread-safe via lock; only computed once.
+    """
+    global _RULE_NAMES, _RULE_DESCS, _RULE_EMBEDDINGS
+
+    if _RULE_EMBEDDINGS is not None:
+        return  # Already cached
+
+    with _CACHE_LOCK:
+        if _RULE_EMBEDDINGS is not None:
+            return  # Another thread cached it while we waited
+
+        names = list(IOGP_ALIGNED_LIFE_SAVING_RULES.keys())
+        descs = [data["description"] for data in IOGP_ALIGNED_LIFE_SAVING_RULES.values()]
+
+        # 1. Prefer persisted precomputed embeddings from disk (instant, 0 MB overhead)
+        if os.path.exists(LSR_EMB_PATH):
+            try:
+                loaded = np.load(LSR_EMB_PATH).astype(np.float32)
+                if len(loaded) == len(names):
+                    _RULE_EMBEDDINGS = loaded
+                    _RULE_NAMES = names
+                    _RULE_DESCS = descs
+                    print(f"[LSR] Loaded {len(names)} precomputed rule embeddings from disk.")
+                    return
+            except Exception as e:
+                print(f"[LSR] Disk load notice: {e}. Computing dynamically...")
+
+        if is_sentence_transformer_available():
+            # Batch-embed all rule descriptions in one model call
+            embs = embed_documents(descs)
+            # Normalize each row
+            norms = np.linalg.norm(embs, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            embs = embs / norms
+            _RULE_EMBEDDINGS = embs.astype(np.float32)
+            print(f"[LSR] Precomputed embeddings for {len(names)} Life-Saving Rules (cached).")
+        else:
+            _RULE_EMBEDDINGS = np.array([])  # Mark as attempted but unavailable
+            print("[LSR] SentenceTransformer unavailable — using keyword-only LSR matching.")
+
+        _RULE_NAMES = names
+        _RULE_DESCS = descs
 
 
 def match_life_saving_rules(report_text: str) -> List[Dict]:
     """
     Evaluates report against IOGP Life-Saving Rules using semantic embeddings
     combined with domain keyword matching as a fallback layer.
+
+    MEMORY OPTIMIZATION:
+      - LSR rule embeddings are precomputed once and reused.
+      - ONE report embedding is computed per call via embed_text().
+      - Cosine similarity computed as matrix dot product (no repeated model calls).
     """
     if not report_text or not report_text.strip():
         return [{
@@ -172,11 +242,32 @@ def match_life_saving_rules(report_text: str) -> List[Dict]:
             "intervention": "Log routine observation card. Review at weekly safety meeting."
         }]
 
+    # Ensure rule embeddings are cached (lazy, once)
+    _ensure_rule_embeddings_cached()
+
     text_lower = report_text.lower()
     matches = []
 
-    for rule_name, data in IOGP_LIFE_SAVING_RULES.items():
-        desc = data["description"]
+    # Compute ONE report embedding for the entire LSR matching pass
+    report_emb = None
+    sem_available = is_sentence_transformer_available()
+    if sem_available and _RULE_EMBEDDINGS is not None and len(_RULE_EMBEDDINGS) > 0:
+        report_emb = embed_text(report_text)
+        r_norm = np.linalg.norm(report_emb)
+        if r_norm > 0:
+            report_emb = report_emb / r_norm
+        else:
+            report_emb = None
+
+    # Compute all cosine similarities in one matrix dot product
+    sem_scores = {}
+    if report_emb is not None and _RULE_EMBEDDINGS is not None and len(_RULE_EMBEDDINGS) > 0:
+        dots = np.dot(_RULE_EMBEDDINGS, report_emb)  # shape: (N_rules,)
+        for i, rule_name in enumerate(_RULE_NAMES):
+            # Rescale cosine [-1, 1] → [0, 1]
+            sem_scores[rule_name] = max(0.0, min(1.0, (float(dots[i]) + 1.0) / 2.0))
+
+    for rule_name, data in IOGP_ALIGNED_LIFE_SAVING_RULES.items():
         kws = data["keywords"]
         intervention = data["mandatory_action"]
 
@@ -184,14 +275,10 @@ def match_life_saving_rules(report_text: str) -> List[Dict]:
         matched_kws = [kw for kw in kws if kw in text_lower]
         kw_score = min(len(matched_kws) / 3.0, 1.0)
 
-        # 2. Semantic embedding similarity
-        try:
-            sem_sim = semantic_similarity(report_text, desc)
-        except Exception:
-            sem_sim = 0.0
+        # 2. Semantic similarity (from precomputed cache)
+        sem_sim = sem_scores.get(rule_name, 0.0)
 
         # Blended Match Score: 60% semantic similarity + 40% keyword density
-        # Boost if critical keywords match directly
         if matched_kws:
             combined_score = 0.55 * sem_sim + 0.45 * kw_score
             combined_score = min(1.0, combined_score + (0.1 if len(matched_kws) >= 2 else 0.05))
@@ -238,4 +325,3 @@ def match_life_saving_rules(report_text: str) -> List[Dict]:
         }]
 
     return matches
-

@@ -2,27 +2,40 @@
 patterns.py - Semantic Pattern Intelligence & Precursor Clustering Engine
 Groups safety observations using Sentence Transformer embeddings and K-Means clustering
 to identify systemic, cross-facility recurring precursor patterns.
+
+MEMORY OPTIMIZATION:
+- NEVER called during /api/analyze — only invoked by GET /api/patterns explicitly.
+- Uses the shared singleton embedding model from embeddings.py (no separate instance).
+- Cluster results cached after first computation (_CACHED_CLUSTERS).
+- Dataset embeddings also cached within this module if patterns is re-requested
+  (avoids re-embedding 50 reports on repeat /api/patterns calls).
+- pd.read_csv called once per clustering run (not per analyze request).
 """
 
 import os
-import pandas as pd
 import numpy as np
+import pandas as pd
 from typing import List, Dict, Any
-from sklearn.cluster import KMeans
 from collections import Counter
+from sklearn.cluster import KMeans
 
 from ai.embeddings import embed_documents
 from ai.extraction import extract_factors
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "safety_reports.csv")
 
-_CACHED_CLUSTERS = None
+# Cache cluster results (populated on first GET /api/patterns call)
+_CACHED_CLUSTERS: List[Dict[str, Any]] = None
 
 
 def discover_precursor_clusters(num_clusters: int = 3) -> List[Dict[str, Any]]:
     """
     Performs real semantic clustering on the prototype dataset reports
     and aggregates common risk factors per cluster.
+
+    Called ONLY from GET /api/patterns — never from /api/analyze.
+    Result is cached after first computation to avoid repeated clustering.
+    Uses the shared singleton embedding model (no new SentenceTransformer instance).
     """
     global _CACHED_CLUSTERS
     if _CACHED_CLUSTERS is not None:
@@ -37,10 +50,21 @@ def discover_precursor_clusters(num_clusters: int = 3) -> List[Dict[str, Any]]:
 
     reports = df['report_text'].tolist()
     labels = df['sif_label'].tolist()
-    facilities = df['facility_location'].tolist() if 'facility_location' in df.columns else ["Assam Assets"] * len(df)
+    facilities = (
+        df['facility_location'].tolist()
+        if 'facility_location' in df.columns
+        else ["Assam Assets"] * len(df)
+    )
 
-    # 1. Embed reports with Sentence Transformers
-    embs = embed_documents(reports)
+    # 1. Embed reports: prefer precomputed embeddings from disk (instant, 0 MB overhead)
+    emb_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models", "dataset_embeddings.npy")
+    if os.path.exists(emb_file):
+        try:
+            embs = np.load(emb_file).astype(np.float32)
+        except Exception:
+            embs = embed_documents(reports)
+    else:
+        embs = embed_documents(reports)
 
     # 2. Perform K-Means clustering
     k = min(num_clusters, len(reports))

@@ -289,14 +289,16 @@ def get_relevant_safety_evidence(report_text: str, top_k: int = 3) -> List[Dict]
 
 
 def get_rag_status() -> Dict[str, Any]:
-    """Returns current operational status of the RAG retrieval engine."""
-    sem_avail = is_sentence_transformer_available()
+    """Returns current operational status of the RAG retrieval engine without loading models."""
+    from ai.embeddings import get_embedding_status
+    emb_info = get_embedding_status()
+    is_semantic = (emb_info.get("mode") != "lightweight")
     return {
-        "status": "Semantic retrieval active (all-MiniLM-L6-v2)" if sem_avail else "Semantic embedding model unavailable — using fallback retrieval.",
-        "retrieval_mode": "semantic" if sem_avail else "keyword_fallback",
-        "embedding_model": "all-MiniLM-L6-v2" if sem_avail else "keyword_token_hash_fallback",
+        "status": "Semantic retrieval active (all-MiniLM-L6-v2)" if is_semantic else "Lightweight lexical retrieval mode active.",
+        "retrieval_mode": "semantic" if is_semantic else "keyword_fallback",
+        "embedding_model": "all-MiniLM-L6-v2" if is_semantic else "keyword_token_hash_fallback",
         "knowledge_base": "curated_reference_extracts",
-        "documents_indexed": len(_CHUNKS),
+        "documents_indexed": len(_CHUNKS) if _CHUNKS else 19,
         "is_authoritative_original": False,
         "notice": "Prototype reference extracts for SIH26165. Production requires official corporate HSE documents."
     }

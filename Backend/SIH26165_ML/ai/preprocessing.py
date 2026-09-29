@@ -4,39 +4,22 @@ Preserves critical negation and failure terms while standardizing oilfield abbre
 """
 
 import re
-import nltk
-
-# Auto-download required NLTK corpuses if missing
-for resource in ['stopwords', 'wordnet', 'punkt', 'punkt_tab']:
-    try:
-        nltk.data.find(f'corpora/{resource}' if resource in ['stopwords', 'wordnet'] else f'tokenizers/{resource}')
-    except (LookupError, ValueError):
-        try:
-            nltk.download(resource, quiet=True)
-        except Exception:
-            pass
-
-try:
-    from nltk.corpus import stopwords
-    from nltk.stem import WordNetLemmatizer
-    from nltk.tokenize import word_tokenize
-    lemmatizer = WordNetLemmatizer()
-    standard_stopwords = set(stopwords.words('english'))
-except Exception:
-    lemmatizer = None
-    standard_stopwords = {
-        'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 'your', 'yours',
-        'he', 'him', 'his', 'himself', 'she', 'her', 'hers', 'it', 'its', 'itself', 'they',
-        'them', 'their', 'theirs', 'what', 'which', 'who', 'whom', 'this', 'that', 'these',
-        'those', 'am', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has',
-        'had', 'having', 'do', 'does', 'did', 'doing', 'a', 'an', 'the', 'and', 'but', 'if',
-        'or', 'because', 'as', 'until', 'while', 'of', 'at', 'by', 'for', 'with', 'about',
-        'between', 'into', 'through', 'during', 'before', 'after', 'to', 'from', 'up', 'down',
-        'in', 'out', 'on', 'off', 'over', 'under', 'again', 'further', 'then', 'once', 'here',
-        'there', 'when', 'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more',
-        'most', 'other', 'some', 'such', 'only', 'own', 'same', 'so', 'than', 'too', 'very',
-        's', 't', 'can', 'will', 'just', 'don', 'should', 'now'
-    }
+# Standard English stopwords (lightweight, deterministic, zero-dependency)
+# Eliminates heavy NLTK (~140-280 MB RAM) and startup network downloads
+standard_stopwords = {
+    'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 'your', 'yours',
+    'he', 'him', 'his', 'himself', 'she', 'her', 'hers', 'it', 'its', 'itself', 'they',
+    'them', 'their', 'theirs', 'what', 'which', 'who', 'whom', 'this', 'that', 'these',
+    'those', 'am', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has',
+    'had', 'having', 'do', 'does', 'did', 'doing', 'a', 'an', 'the', 'and', 'but', 'if',
+    'or', 'because', 'as', 'until', 'while', 'of', 'at', 'by', 'for', 'with', 'about',
+    'between', 'into', 'through', 'during', 'before', 'after', 'to', 'from', 'up', 'down',
+    'in', 'out', 'on', 'off', 'over', 'under', 'again', 'further', 'then', 'once', 'here',
+    'there', 'when', 'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more',
+    'most', 'other', 'some', 'such', 'only', 'own', 'same', 'so', 'than', 'too', 'very',
+    's', 't', 'can', 'will', 'just', 'don', 'should', 'now'
+}
+lemmatizer = None
 
 # Domain-specific oilfield abbreviations
 SAFETY_ABBREVIATIONS = {
@@ -109,13 +92,4 @@ def preprocess(text: str) -> str:
     # 4. Remove standard stopwords (preserving safety negations)
     filtered = [w for w in tokens if w not in FINAL_STOPWORDS]
 
-    # 5. Lemmatize
-    if lemmatizer:
-        try:
-            processed = [lemmatizer.lemmatize(w) for w in filtered]
-        except Exception:
-            processed = filtered
-    else:
-        processed = filtered
-
-    return ' '.join(processed)
+    return ' '.join(filtered)

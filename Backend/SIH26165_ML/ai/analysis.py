@@ -4,12 +4,21 @@ Coordinates the complete, explainable AI safety intelligence pipeline:
 Text Preprocessing -> Hybrid SIF Classifier -> Information Extraction ->
 Semantic LSR Matching -> FAISS/RAG Retrieval -> Grounded LLM Explanation ->
 Similar Precursor Retrieval -> Audit Metadata & Versioning.
+
+MEMORY OPTIMIZATION:
+- Dataset reports loaded once into _REPORTS_CACHE (lazy).
+- Report embeddings for similar-report lookup: dataset embeddings are
+  precomputed once and cached (_DATASET_EMBEDDINGS). Query embedding
+  computed once per request via ONE encode() call, then compared as
+  a matrix dot product — no per-report encode() calls.
 """
 
 import os
+import threading
+import numpy as np
 import pandas as pd
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from ai.preprocessing import preprocess
 from ai.classifier import predict_sif_risk
@@ -17,54 +26,148 @@ from ai.extraction import extract_factors
 from ai.lsr import match_life_saving_rules
 from ai.rag import get_relevant_safety_evidence, get_knowledge_base_version
 from ai.llm import generate_grounded_explanation, get_llm_model_name
-from ai.embeddings import get_embedding_model_name, embed_text, semantic_similarity
+from ai.embeddings import get_embedding_model_name, embed_text, embed_documents, is_sentence_transformer_available
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "safety_reports.csv")
 
 _REPORTS_CACHE: List[Dict[str, Any]] = []
+_DATASET_EMBEDDINGS: Optional[np.ndarray] = None  # shape: (N, 384) — computed once
+_DATASET_TEXTS: List[str] = []
+_DATASET_LOCK = threading.Lock()
 
 
-def _get_dataset_reports() -> List[Dict[str, Any]]:
-    """Loads dataset reports once for semantic similarity retrieval."""
-    global _REPORTS_CACHE
-    if _REPORTS_CACHE:
-        return _REPORTS_CACHE
+def _ensure_dataset_ready():
+    """
+    Loads dataset reports and precomputes embeddings ONCE.
+    Thread-safe. Subsequent calls return immediately.
+    """
+    global _REPORTS_CACHE, _DATASET_EMBEDDINGS, _DATASET_TEXTS
 
-    if os.path.exists(DATA_PATH):
+    if _DATASET_EMBEDDINGS is not None or not is_sentence_transformer_available():
+        if _REPORTS_CACHE:
+            return
+        # Embedding model unavailable — load reports only (for keyword fallback)
+        if not _REPORTS_CACHE and os.path.exists(DATA_PATH):
+            try:
+                df = pd.read_csv(DATA_PATH)
+                _REPORTS_CACHE = df.to_dict(orient="records")
+            except Exception:
+                _REPORTS_CACHE = []
+        return
+
+    with _DATASET_LOCK:
+        if _DATASET_EMBEDDINGS is not None:
+            return  # Another thread cached it
+
+        if not os.path.exists(DATA_PATH):
+            _REPORTS_CACHE = []
+            _DATASET_EMBEDDINGS = np.empty((0, 384), dtype=np.float32)
+            return
+
         try:
             df = pd.read_csv(DATA_PATH)
             _REPORTS_CACHE = df.to_dict(orient="records")
-        except Exception:
+            texts = [str(r.get("report_text", "")) for r in _REPORTS_CACHE]
+            _DATASET_TEXTS = texts
+
+            # 1. Prefer persisted precomputed embeddings from disk (instant, 0 MB overhead)
+            emb_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models", "dataset_embeddings.npy")
+            if os.path.exists(emb_file):
+                try:
+                    loaded = np.load(emb_file).astype(np.float32)
+                    if len(loaded) == len(texts):
+                        _DATASET_EMBEDDINGS = loaded
+                        print(f"[Analysis] Loaded {len(texts)} precomputed dataset embeddings from disk.")
+                        return
+                except Exception as e:
+                    print(f"[Analysis] Disk load notice: {e}. Computing dynamically...")
+
+            # Fallback: compute dynamically if not on disk
+            embs = embed_documents(texts)
+            norms = np.linalg.norm(embs, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            _DATASET_EMBEDDINGS = (embs / norms).astype(np.float32)
+            print(f"[Analysis] Precomputed embeddings for {len(texts)} dataset reports (cached).")
+        except Exception as e:
+            print(f"[Analysis] Dataset precompute notice: {e}")
             _REPORTS_CACHE = []
-    return _REPORTS_CACHE
+            _DATASET_EMBEDDINGS = np.empty((0, 384), dtype=np.float32)
 
 
 def find_similar_reports(query_text: str, top_k: int = 2) -> List[Dict[str, Any]]:
-    """Retrieves genuinely similar safety reports from the curated dataset using embeddings."""
-    reports = _get_dataset_reports()
-    if not reports:
+    """
+    Retrieves genuinely similar safety reports from the curated dataset.
+
+    MEMORY OPTIMIZATION:
+      - Dataset embeddings precomputed once (_DATASET_EMBEDDINGS).
+      - ONE query embedding per call, then matrix dot product.
+      - No per-report encode() calls during request handling.
+    """
+    _ensure_dataset_ready()
+
+    if not _REPORTS_CACHE:
         return []
 
+    # Semantic path: matrix dot product with precomputed embeddings
+    if (
+        is_sentence_transformer_available()
+        and _DATASET_EMBEDDINGS is not None
+        and len(_DATASET_EMBEDDINGS) > 0
+    ):
+        q_vec = embed_text(query_text).astype(np.float32)
+        q_norm = np.linalg.norm(q_vec)
+        if q_norm == 0:
+            return []
+        q_vec = q_vec / q_norm
+
+        # One matrix multiply to get all cosine similarities
+        dots = np.dot(_DATASET_EMBEDDINGS, q_vec)  # shape: (N,)
+
+        results = []
+        for idx in np.argsort(dots)[::-1]:
+            r = _REPORTS_CACHE[idx]
+            rep_text = r.get("report_text", "")
+            if rep_text.strip() == query_text.strip():
+                continue
+            sim_raw = float(dots[idx])
+            sim = max(0.0, min(1.0, (sim_raw + 1.0) / 2.0))
+            if sim < 0.45:
+                break  # Sorted desc — nothing below threshold
+            results.append({
+                "report_id": r.get("report_id", "HIST-OBS"),
+                "similarity_score": round(sim, 3),
+                "text": rep_text[:140] + "...",
+                "location": r.get("facility_location", r.get("location", "Asset Facility")),
+                "sif_label": int(r.get("sif_label", 0)),
+                "risk_level": r.get("risk_level", "HIGH" if r.get("sif_label") == 1 else "LOW")
+            })
+            if len(results) >= top_k:
+                break
+        return results
+
+    # Lexical fallback path (no model)
+    _ensure_dataset_ready()
+    t1_words = set(w.lower() for w in query_text.split() if len(w) > 2)
     scored = []
-    for r in reports:
+    for r in _REPORTS_CACHE:
         rep_text = r.get("report_text", "")
-        # Avoid exact duplicate
         if rep_text.strip() == query_text.strip():
             continue
-        try:
-            sim = semantic_similarity(query_text, rep_text)
-            if sim > 0.45:
-                scored.append((sim, r))
-        except Exception:
-            pass
+        t2_words = set(w.lower() for w in rep_text.split() if len(w) > 2)
+        if not t1_words or not t2_words:
+            continue
+        jaccard = len(t1_words & t2_words) / float(len(t1_words | t2_words))
+        if jaccard > 0.20:
+            scored.append((jaccard, r))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     results = []
     for sim, r in scored[:top_k]:
+        rep_text = r.get("report_text", "")
         results.append({
             "report_id": r.get("report_id", "HIST-OBS"),
             "similarity_score": round(sim, 3),
-            "text": r.get("report_text", "")[:140] + "...",
+            "text": rep_text[:140] + "...",
             "location": r.get("facility_location", r.get("location", "Asset Facility")),
             "sif_label": int(r.get("sif_label", 0)),
             "risk_level": r.get("risk_level", "HIGH" if r.get("sif_label") == 1 else "LOW")
@@ -181,7 +284,6 @@ def analyze_full_pipeline(report_text: str) -> Dict[str, Any]:
         # Semantic Similar Patterns
         "similar_patterns": similar_patterns
     }
-
 
 
 # Convenience alias for tests and external callers

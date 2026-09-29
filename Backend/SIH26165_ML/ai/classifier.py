@@ -128,7 +128,7 @@ def train_baseline_model():
         max_depth=8,
         random_state=42,
         class_weight='balanced',
-        n_jobs=-1
+        n_jobs=1  # Single worker on Render Free — avoid parallel memory duplication
     )
     _CLASSIFIER.fit(X_combined, y)
 
